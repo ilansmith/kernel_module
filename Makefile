@@ -1,8 +1,8 @@
 KDIR:=/lib/modules/$(shell uname -r)/build
 PWD:=$(shell pwd)
 
-KO=<ko_name>
-OBJS=<object list>
+KO=mymodule
+OBJS=mymodule.o
 
 # what are we compiling?
 # NOTE obj-m, not obj -m, NOT mymodules.c, Just:
