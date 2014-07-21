@@ -1,0 +1,17 @@
+tags
+
+.tmp_versions
+Module.symvers
+modules.order
+sys_module
+
+*.ko.cmd
+*.o.cmd
+
+*.mod.c
+*.mod.o
+*.mod.o.cmd
+
+*.o
+*.ko
+
