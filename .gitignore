@@ -4,6 +4,7 @@ tags
 Module.symvers
 modules.order
 sys_module
+kernel_headers
 
 .Module.symvers.cmd
 .ias_blkdev.mod.cmd
