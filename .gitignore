@@ -4,6 +4,7 @@ tags
 Module.symvers
 modules.order
 sys_module
+kernel_headers
 
 *.ko.cmd
 *.o.cmd

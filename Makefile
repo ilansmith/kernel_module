@@ -16,11 +16,13 @@ default:
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	$(shell rm -f sys_module, new_module.tar.gz)
+	$(shell rm -f sys_module kernel_headers new_module.tar.gz)
 
 sl:
 	@echo "creating soft link: sys_module -> /sys/modules/$(KO)"
 	@ln -sf /sys/module/$(KO) sys_module
+	@echo "creating soft link: kernel_headers -> $(KDIR)"
+	@ln -sf $(KDIR) kernel_headers
 
 export:
 	@echo "exporting to new_module.tar.gz..."
