@@ -1,26 +1,27 @@
 KDIR:=/lib/modules/$(shell uname -r)/build
 PWD:=$(shell pwd)
 
-KO=mymodule
-OBJS=mymodule.o
+KO=ias_blkdev
+OBJS=ias_blkdev.o
 
-# what are we compiling?
-# NOTE obj-m, not obj -m, NOT mymodules.c, Just:
 obj-m := $(OBJS)
 
-.PHONY: clean sl export
+.PHONY: clean cleanall sl export
 
-# finally...
+define build
+	$(MAKE) -C $(KDIR) M=$(PWD) $1
+endef
+
 default: sl
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(call build,modules)
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	$(shell rm -f sys_module kernel_headers new_module.tar.gz)
+	$(call build,clean)
+
+cleanall:clean
+	$(shell rm -f sys_module kernel_headers new_module.tar.gz tags)
 
 sl:
-	@echo "creating soft link: sys_module -> /sys/modules/$(KO)"
-	@ln -sf /sys/module/$(KO) sys_module
 	@echo "creating soft link: kernel_headers -> $(KDIR)"
 	@ln -sf $(KDIR) kernel_headers
 
