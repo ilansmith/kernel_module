@@ -243,16 +243,6 @@ static int ias_threadfn(void *data)
 		set_current_state(TASK_RUNNING);
 		ias_dbg("dequed request %d: 0x%p", i, req);
 
-		if (req->cmd_type != REQ_TYPE_FS) {
-			ias_dbg("WTF? request %d was of type %d", i,
-				req->cmd_type);
-
-			/* The spinlock is arelady aquired, calling
-			 * blk_end_request_all() will try to quire it again */
-			__blk_end_request_all(req, -EIO);
-			continue;
-		}
-
 		ias_transfer(q, blk_rq_pos(req), blk_rq_cur_sectors(req),
 			bio_data(req->bio), rq_data_dir(req));
 
