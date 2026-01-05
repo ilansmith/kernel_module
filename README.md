@@ -1,14 +1,13 @@
 # IAS Block Device Kernel Module
 
-A simple RAM-backed block device kernel module for Linux kernel 3.10.
+A simple RAM-backed block device kernel module for Linux kernel 5.15.
 
 ## Overview
 
 This kernel module creates a virtual block device that stores all data in RAM. It serves as an educational example demonstrating:
 
 - Linux block device driver architecture
-- Request-based I/O processing using request queues
-- Kernel thread for asynchronous request handling
+- Bio-based I/O processing using `submit_bio`
 - Kernel memory allocation with `vmalloc`
 - Optional debugfs interface for debugging
 
@@ -23,23 +22,20 @@ This kernel module creates a virtual block device that stores all data in RAM. I
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │              Linux Block Layer                          │
-│         (creates requests, manages queue)               │
+│           (creates bio structures)                      │
 └────────────────────────┬────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │              ias_blkdev module                          │
 │                                                         │
-│   request_fn() ──► wake_up_process(thread)              │
+│   submit_bio() ──► bio_for_each_segment()               │
 │                           │                             │
 │                           ▼                             │
-│   ias_threadfn() ◄── blk_fetch_request()                │
-│         │                                               │
-│         ▼                                               │
-│   ias_transfer() ──► memcpy to/from RAM buffer          │
-│         │                                               │
-│         ▼                                               │
-│   __blk_end_request_all()                               │
+│                    ias_transfer()                       │
+│                           │                             │
+│                           ▼                             │
+│              memcpy to/from RAM buffer                  │
 │                                                         │
 │   ┌─────────────────────────────────────────────────┐   │
 │   │     physical_dev (RAM buffer - 100MB default)   │   │
@@ -51,10 +47,8 @@ This kernel module creates a virtual block device that stores all data in RAM. I
 When loaded, the module:
 1. Registers a block device with the kernel
 2. Allocates a RAM buffer (default 100MB) using `vmalloc`
-3. Creates a request queue with `blk_init_queue()`
-4. Starts a kernel thread to process I/O requests
-5. Creates `/dev/ias_blkdev` - a block device backed by this RAM buffer
-6. All reads/writes are queued as requests and processed by the kernel thread
+3. Creates `/dev/ias_blkdev` - a block device backed by this RAM buffer
+4. All reads/writes to the device are translated to `memcpy` operations on the buffer
 
 **Note:** Data is volatile - it persists while the module is loaded but is lost when the module is unloaded or the system reboots.
 
@@ -416,14 +410,12 @@ sudo insmod ias_blkdev.ko size=268435456
 
 ## Kernel Compatibility
 
-This version is compatible with **Linux kernel 3.10**. Key APIs used:
+This version is compatible with **Linux kernel 5.15**. Key APIs used:
 
-- `blk_init_queue()` - Initialize request queue with request handler
-- `blk_fetch_request()` - Fetch next request from queue
-- `__blk_end_request_all()` - Complete request processing
-- `alloc_disk()` - Allocate gendisk structure
-- `kthread_run()` - Create kernel thread for request processing
-- `blk_cleanup_queue()` - Clean up request queue
+- `blk_alloc_disk()` - Allocates gendisk and queue together
+- `submit_bio` callback - Bio-based I/O processing
+- `bio_for_each_segment()` - Iterating bio segments
+- `kmap_local_page()` - Page mapping for data access
 
 ## License
 
