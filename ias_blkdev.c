@@ -1,6 +1,6 @@
 #include <linux/module.h>
 #include <linux/blkdev.h>
-#include <linux/kthread.h>
+#include <linux/bio.h>
 #include <linux/mutex.h>
 #include <linux/vmalloc.h>
 #include <uapi/linux/hdreg.h>
@@ -34,7 +34,6 @@ MODULE_LICENSE ("GPL");
 #define IAS_BLKDEV_DEFAULT_SIZE MB(100)
 #define IAS_MINOR_FIRST 0
 #define IAS_MINOR_CNT 16
-#define IAS_MINOR_NUM 8
 #define IAS_DEBUGFS_DIR "ias"
 
 #ifdef IAS_DEBUG_FS
@@ -65,21 +64,17 @@ MODULE_LICENSE ("GPL");
 	}
 #endif
 
-#define BYTES_TO_SECTORS(bytes) ((bytes) >> 9)
-#define SECTORS_TO_BYTES(sectors) ((sectors) << 9)
+#define BYTES_TO_SECTORS(bytes) ((bytes) >> SECTOR_SHIFT)
+#define SECTORS_TO_BYTES(sectors) ((sectors) << SECTOR_SHIFT)
 
-#define SECTOR_SIZE 512
+#define IAS_SECTOR_SIZE 512
 
 struct ias_blkdev {
 	int major;
 	u8 *physical_dev;
 	u32 physical_size;
 	spinlock_t dlock;
-	struct request_queue *queue;
-	spinlock_t qlock;
 	struct gendisk *disk;
-	struct task_struct *thread;
-	struct mutex thread_mtx;
 #ifdef IAS_DEBUG_FS
 	struct dentry *debugfs_dir;
 #endif
@@ -187,91 +182,53 @@ static inline void ias_blkdev_exit_debugfs(struct ias_blkdev *bd)
 }
 #endif
 
-/* block device */
-static void ias_transfer(struct request_queue *q, unsigned long sector,
-	unsigned long num_sec, char *buf, int write)
+/* block device - bio processing */
+static void ias_transfer(struct ias_blkdev *bd, sector_t sector,
+	unsigned int len, char *buf, int write)
 {
-	struct ias_blkdev *bd = (struct ias_blkdev*)q->queuedata;
-	u32 offset = SECTORS_TO_BYTES(sector);
-	u32 count = SECTORS_TO_BYTES(num_sec);
+	u64 offset = SECTORS_TO_BYTES(sector);
 
-	ias_dbg("Called with queue: 0x%p, sector: 0x%lx, num_sec: %lu, "
-		"buf: 0x%p, write: %d", q, sector, num_sec, buf, write);
+	ias_dbg("Called with sector: %llu, len: %u, buf: 0x%p, write: %d",
+		(unsigned long long)sector, len, buf, write);
 
 	/* verify you're in limits */
-	if (offset + count > bd->physical_size) {
-		ias_dbg("Device overflow: offset + count: %u, capacity: %u",
-			offset + count, bd->physical_size);
+	if (offset + len > bd->physical_size) {
+		ias_dbg("Device overflow: offset + len: %llu, capacity: %u",
+			(unsigned long long)(offset + len), bd->physical_size);
 		return;
 	}
 
 	spin_lock_irq(&bd->dlock);
 	if (write)
-		memcpy(bd->physical_dev + offset, buf, count);
+		memcpy(bd->physical_dev + offset, buf, len);
 	else
-		memcpy(buf, bd->physical_dev + offset, count);
+		memcpy(buf, bd->physical_dev + offset, len);
 	spin_unlock_irq(&bd->dlock);
 }
 
-static int ias_threadfn(void *data)
+static blk_qc_t ias_submit_bio(struct bio *bio)
 {
-	struct ias_blkdev *bd = (struct ias_blkdev*)data;
-	struct request_queue *q = bd->queue;
-	int i = 0;
+	struct ias_blkdev *bd = bio->bi_bdev->bd_disk->private_data;
+	struct bio_vec bvec;
+	struct bvec_iter iter;
+	sector_t sector = bio->bi_iter.bi_sector;
+	int write = bio_data_dir(bio) == WRITE;
 
-	ias_dbg("started thread");
+	ias_dbg("Called with bio: 0x%p, sector: %llu, write: %d",
+		bio, (unsigned long long)sector, write);
 
-	mutex_lock(&bd->thread_mtx);
-	while (!kthread_should_stop()) {
-		struct request *req;
+	bio_for_each_segment(bvec, bio, iter) {
+		char *buf = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
+		unsigned int len = bvec.bv_len;
 
-		spin_lock_irq(q->queue_lock);
-		set_current_state(TASK_INTERRUPTIBLE);
-		req = blk_fetch_request(q);
-		spin_unlock_irq(q->queue_lock);
+		ias_transfer(bd, sector, len, buf, write);
+		kunmap_local(buf);
 
-		if (!req) {
-			ias_dbg("no more requests, going to sleep... zzz...");
-			mutex_unlock(&bd->thread_mtx);
-			schedule();
-			mutex_lock(&bd->thread_mtx);
-			ias_dbg("someone woke me, good morning");
-			i = 0;
-			continue;
-		}
-
-		set_current_state(TASK_RUNNING);
-		ias_dbg("dequed request %d: 0x%p", i, req);
-
-		if (req->cmd_type != REQ_TYPE_FS) {
-			ias_dbg("WTF? request %d was of type %d", i,
-				req->cmd_type);
-
-			/* The spinlock is arelady aquired, calling
-			 * blk_end_request_all() will try to quire it again */
-			__blk_end_request_all(req, -EIO);
-			continue;
-		}
-
-		ias_transfer(q, blk_rq_pos(req), blk_rq_cur_sectors(req),
-			bio_data(req->bio), rq_data_dir(req));
-
-		__blk_end_request_all(req, 0);
-		i++;
+		sector += BYTES_TO_SECTORS(len);
 	}
-	mutex_unlock(&bd->thread_mtx);
 
-	return 0;
-}
-
-/* this function is called while q->spin_lock is held. make sure not to try
- * and lock it again or to call function which try to do so */
-static void ias_blkdev_request_fn(struct request_queue *q)
-{
-	struct ias_blkdev *bd = q->queuedata;
-
-	ias_dbg("Called, waking up bd thread");
-	wake_up_process(bd->thread);
+	bio_endio(bio);
+	return BLK_QC_T_NONE;
 }
 
 static int ias_blkdev_open(struct block_device *bdev, fmode_t mode)
@@ -299,14 +256,17 @@ static int ias_blkdev_getgeo(struct block_device *bdev, struct hd_geometry *geo)
 }
 
 static const struct block_device_operations ias_disk_fops = {
+	.owner = THIS_MODULE,
 	.open = ias_blkdev_open,
 	.release = ias_blkdev_release,
 	.getgeo = ias_blkdev_getgeo,
-	.owner = THIS_MODULE,
+	.submit_bio = ias_submit_bio,
 };
 
 static int __init ias_blkdev_init(void)
 {
+	int err;
+
 	/* register block device */
 	ibd.major = register_blkdev(0, IAS_BLKDEV_NAME);
 	if (ibd.major < 0)
@@ -316,76 +276,56 @@ static int __init ias_blkdev_init(void)
 	/* initialize pseudo physical device */
 	ibd.physical_dev = (u8*)vmalloc(size);
 	if (!ibd.physical_dev)
-		goto error;
+		goto error_unregister;
 	memset(ibd.physical_dev, 0, size);
 	ibd.physical_size = size;
 	ias_dbg("Allocated pysical device: 0x%x bytes at 0x%p", size,
 		ibd.physical_dev);
 
-	/* initialize queue spinlock */
-	spin_lock_init(&ibd.qlock);
+	/* initialize device spinlock */
+	spin_lock_init(&ibd.dlock);
 	ias_dbg("Initialized device spinlock");
 
-	/* initialize request queue */
-	ibd.queue = blk_init_queue(ias_blkdev_request_fn, &ibd.qlock);
-	if (!ibd.queue)
-		goto error;
-	ias_dbg("Initialized request queue");
-
-	blk_queue_logical_block_size(ibd.queue, SECTOR_SIZE);
-	ias_dbg("Set queue logical block size to: %u bytes", SECTOR_SIZE);
-
-	ibd.queue->queuedata = &ibd;
-	ias_dbg("Set queue data: 0x%p (&ibd)", &ibd);
-
-	mutex_init(&ibd.thread_mtx);
-	ias_dbg("Initialized thread mutex");
-
-	/* initialize request handling thread */
-	ibd.thread = kthread_run(ias_threadfn, &ibd, "ias");
-	if (IS_ERR(ibd.thread))
-		goto error;
-	ias_dbg("Initialized queue handler thread");
-
-	/* initialize generic disk */
-	ibd.disk = alloc_disk(IAS_MINOR_CNT);
+	/* allocate disk - this also allocates the queue in kernel 5.15+ */
+	ibd.disk = blk_alloc_disk(NUMA_NO_NODE);
 	if (!ibd.disk)
-		goto error;
+		goto error_free_physical;
 	ias_dbg("Allocated disk: 0x%p", ibd.disk);
 
-	spin_lock_init(&ibd.dlock);
-	ias_dbg("Initialized memory lock");
+	/* configure the disk */
 	ibd.disk->major = ibd.major;
 	ibd.disk->first_minor = IAS_MINOR_FIRST;
-	ibd.disk->minors = IAS_MINOR_NUM;
-	ibd.disk->queue = ibd.queue;
+	ibd.disk->minors = IAS_MINOR_CNT;
 	ibd.disk->fops = &ias_disk_fops;
 	ibd.disk->private_data = (void*)&ibd;
 	set_disk_ro(ibd.disk, 0);
 	set_capacity(ibd.disk, BYTES_TO_SECTORS(size));
 	strncpy(ibd.disk->disk_name, IAS_BLKDEV_NAME, DISK_NAME_LEN);
+
+	/* set logical block size */
+	blk_queue_logical_block_size(ibd.disk->queue, IAS_SECTOR_SIZE);
+	ias_dbg("Set queue logical block size to: %u bytes", IAS_SECTOR_SIZE);
+
 	ias_dbg("Initialized gendisk: 0x%p, minors: %d", ibd.disk,
 		IAS_MINOR_CNT);
 
-	add_disk(ibd.disk);
+	/* add disk to the system - in 5.15 this returns an error code */
+	err = add_disk(ibd.disk);
+	if (err) {
+		ias_dbg("Failed to add disk: %d", err);
+		goto error_put_disk;
+	}
 	ias_dbg("Added disk");
 
 	ias_blkdev_init_debugfs(&ibd);
 	return 0;
 
-error:
-	ias_blkdev_exit_debugfs(&ibd);
-
-	if (ibd.disk)
-		del_gendisk(ibd.disk);
-	if (!IS_ERR(ibd.thread))
-		kthread_stop(ibd.thread);
-	if (ibd.queue)
-		blk_cleanup_queue(ibd.queue);
-	if (ibd.physical_dev)
-		vfree(ibd.physical_dev);
-	if (0 < ibd.major)
-		unregister_blkdev(ibd.major, IAS_BLKDEV_NAME);
+error_put_disk:
+	put_disk(ibd.disk);
+error_free_physical:
+	vfree(ibd.physical_dev);
+error_unregister:
+	unregister_blkdev(ibd.major, IAS_BLKDEV_NAME);
 
 	return -1;
 }
@@ -395,18 +335,10 @@ static void __exit ias_blkdev_exit(void)
 	/* delete debugfs entries */
 	ias_blkdev_exit_debugfs(&ibd);
 
-	/* delete generic disk */
+	/* delete generic disk - this handles queue cleanup in 5.15+ */
 	del_gendisk(ibd.disk);
 	put_disk(ibd.disk);
 	ias_dbg("Deleted gendisk");
-
-	/* stop queue thread */
-	kthread_stop(ibd.thread);
-	ias_dbg("stopped queue handler thread");
-
-	/* cleanup queue */
-	blk_cleanup_queue(ibd.queue);
-	ias_dbg("Cleaned up request queue");
 
 	/* free physical memory */
 	vfree(ibd.physical_dev);
